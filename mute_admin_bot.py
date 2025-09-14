@@ -15,6 +15,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import RetryAfter, TelegramError
+
 
 # ---------- CONFIG ----------
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -35,7 +37,7 @@ _owner_in_memory: Optional[int] = None
 
 
 # ====== CONFIG for deletion worker ======
-DELETE_RATE_PER_SECOND = 20        # increase for faster deletes (tune down if you hit limits)
+DELETE_RATE_PER_SECOND = 15        # increase for faster deletes (tune down if you hit limits)
 DEBOUNCE_WINDOW_SECONDS = 0.6      # collapse bursts within this window
 MAX_QUEUE_SIZE = 4000              # safety cap
 SPAM_NOTIFY_THRESHOLD = 20         # number of messages queued from same user to treat as heavy spam
@@ -91,89 +93,69 @@ async def _delete_worker(app):
     global _delete_queue
     if _delete_queue is None:
         _delete_queue = asyncio.Queue()
-    # base interval between deletions (seconds)
     base_interval = 1.0 / max(1, DELETE_RATE_PER_SECOND)
     bot = app.bot
 
-    # backoff state
     backoff_multiplier = 1.0
     min_backoff = base_interval
-    max_backoff = 10.0  # if many errors, wait up to 10s between deletes
+    max_backoff = 10.0
 
     while True:
         try:
             chat_id, msg_id, user_id = await _delete_queue.get()
             try:
                 await bot.delete_message(chat_id, msg_id)
-                app.logger.debug("Deleted msg %s from user %s in chat %s", msg_id, user_id, chat_id)
-                # success -> slowly move back to normal rate
+                logger.debug("Deleted msg %s from user %s in chat %s", msg_id, user_id, chat_id)
                 backoff_multiplier = max(1.0, backoff_multiplier * 0.95)
             except RetryAfter as e:
-                # Telegram explicitly told us to wait 'retry_after' seconds
                 wait = float(getattr(e, "retry_after", 1.0))
-                app.logger.warning("Rate limited by Telegram: retry_after=%.2f, backing off.", wait)
-                # re-enqueue this message for later deletion (at the front)
+                logger.warning("Rate limited by Telegram: retry_after=%.2f, backing off.", wait)
+                # re-enqueue after waiting the advised time
+                await asyncio.sleep(wait)
                 try:
-                    # put it back at front by creating new queue with this item first could be heavy;
-                    # simpler: sleep then re-enqueue at end (we logged), since we respect order roughly
-                    await asyncio.sleep(wait)
                     await _delete_queue.put((chat_id, msg_id, user_id))
                 except Exception:
-                    app.logger.exception("Failed to re-enqueue after RetryAfter")
-                # increase multiplier conservatively
+                    logger.exception("Failed to re-enqueue after RetryAfter")
                 backoff_multiplier = min(8.0, backoff_multiplier * 2.0)
             except TelegramError as e:
-                # Non-Retry Telegram errors (Forbidden, BadRequest, etc.)
-                app.logger.debug("TelegramError during delete: %s", e)
-                # don't aggressively backoff for BadRequest (message already deleted etc.)
-                # small sleep to avoid tight loop
+                logger.debug("TelegramError during delete: %s", e)
                 await asyncio.sleep(min_backoff)
             except Exception as e:
-                # Unexpected errors -> exponential backoff
-                app.logger.exception("Unexpected delete error: %s", e)
+                logger.exception("Unexpected delete error: %s", e)
                 backoff_multiplier = min(8.0, backoff_multiplier * 1.5)
                 await asyncio.sleep(min(max_backoff, base_interval * backoff_multiplier))
             else:
-                # normal paced sleep between deletions
                 await asyncio.sleep(min(max_backoff, base_interval * backoff_multiplier))
         except asyncio.CancelledError:
             break
         except Exception:
-            app.logger.exception("Delete worker top-level error, sleeping briefly.")
+            logger.exception("Delete worker top-level error, sleeping briefly.")
             await asyncio.sleep(1.0)
 
 
 def _enqueue_delete(app, chat_id: int, message_id: int, user_id: int):
-    """Non-blocking enqueue with safety bounding and small dedup optimization:
-       if the last queued item is from the same chat+user, we can drop older queued items for that pair.
-    """
     global _delete_queue
     if _delete_queue is None:
         _delete_queue = asyncio.Queue()
 
-    # safety bounding
     try:
         qsize = _delete_queue.qsize()
     except Exception:
         qsize = 0
 
     if qsize >= MAX_QUEUE_SIZE:
-        # drop one oldest to keep memory bounded
         try:
             _delete_queue.get_nowait()
         except Exception:
             pass
 
-    # simple try to reduce duplicates: if pending messages buffer already holds later msgs for this user,
-    # it's okay to enqueue the newest only (we already collapse pending into newest before enqueueing).
     try:
         _delete_queue.put_nowait((chat_id, message_id, user_id))
     except asyncio.QueueFull:
-        # fallback: schedule put
         try:
             asyncio.get_event_loop().create_task(_delete_queue.put((chat_id, message_id, user_id)))
         except Exception:
-            app.logger.exception("Failed to schedule enqueue for delete")
+            logger.exception("Failed to schedule enqueue for delete")
 
 
 # ----- Command handlers -----
@@ -384,12 +366,13 @@ def main():
     # catch all messages
     app.add_handler(MessageHandler(filters.ALL, on_any_message))
 
-        # start delete worker
+    # start delete worker (use Application.create_task)
     try:
         app.create_task(_delete_worker(app))
     except Exception:
-        import asyncio
-        asyncio.get_event_loop().create_task(_delete_worker(app))
+        # fallback, but rarely needed
+        asyncio.create_task(_delete_worker(app))
+
 
 
     logger.info("Starting bot (no DB)...")
