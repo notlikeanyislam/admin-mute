@@ -52,6 +52,18 @@ _user_spam_counters: dict[tuple[int,int], int] = defaultdict(int)
 
 
 # ----- Helpers -----
+
+# Schedule the delete worker once the Application is running
+async def _start_background_workers(app):
+    """Called after Application starts — safe to create background tasks here."""
+    # create the delete worker in the app's running loop
+    try:
+        app.create_task(_delete_worker(app))
+    except Exception:
+        # fallback: schedule on running loop
+        asyncio.get_running_loop().create_task(_delete_worker(app))
+
+
 def get_owner() -> Optional[int]:
     """Return numeric owner id. Priority: OWNER_ID env var, else in-memory claimed owner."""
     if OWNER_ID_ENV:
@@ -362,7 +374,8 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main ---
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    # attach the startup callback so worker starts after the app's loop is running
+    app = ApplicationBuilder().token(TOKEN).post_init(_start_background_workers).build()
 
     # info / owner helpers
     app.add_handler(CommandHandler("start", start_cmd))
@@ -382,17 +395,5 @@ def main():
     # catch all messages
     app.add_handler(MessageHandler(filters.ALL, on_any_message))
 
-    # start delete worker (use Application.create_task)
-    try:
-        app.create_task(_delete_worker(app))
-    except Exception:
-        # fallback, but rarely needed
-        asyncio.create_task(_delete_worker(app))
-
-
-
     logger.info("Starting bot (no DB)...")
     app.run_polling()
-
-if __name__ == "__main__":
-    main()
