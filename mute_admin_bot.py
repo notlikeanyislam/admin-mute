@@ -266,20 +266,72 @@ async def muteadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def unmuteadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unmute a user. Usage: reply to their message with /un OR /un @username OR /un <id>"""
+    chat = update.effective_chat
+    caller = update.effective_user
+    if not chat or chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("This command only works in groups/supergroups.")
+        return
+
+    if not is_authorized(chat.id, caller.id):
+        await update.message.reply_text("You are not authorized to use this bot (owner or allowed admin only).")
+        return
+
+    # Ensure we operate on the real set stored in MUTED
+    chat_set = MUTED.setdefault(chat.id, set())
+
+    # 1) If reply -> target = replied user
+    target_user = None
+    if update.message.reply_to_message:
+        target_user = update.message.reply_to_message.from_user
+
+    # 2) If args provided -> try username or numeric id
+    if not target_user and context.args:
+        arg = context.args[0].strip()
+        # if numeric id
+        try:
+            uid = int(arg)
+            # remove by id even if user not in chat — use setdefault to modify actual store
+            chat_set.discard(uid)
+            await update.message.reply_text(f"✅ User id `{uid}` removed from auto-delete list (if present).", parse_mode="Markdown")
+            return
+        except ValueError:
+            # not numeric, maybe @username
+            if arg.startswith("@"):
+                # try to resolve via get_chat_member (best-effort)
+                try:
+                    member = await context.bot.get_chat_member(chat.id, arg)
+                    target_user = member.user
+                except Exception:
+                    await update.message.reply_text("Couldn't resolve that @username in this chat. Try replying to their message or pass their numeric id.")
+                    return
+
+    if not target_user:
+        await update.message.reply_text("Reply to the user or provide @username / id: /un @user or /un 123456789")
+        return
+
+    # now we have a User object
+    uid = target_user.id
+    if uid in chat_set:
+        chat_set.discard(uid)
+        await update.message.reply_text(f"✅ {target_user.full_name} (`{uid}`) removed from auto-delete list (in-memory).", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"User {target_user.full_name} (`{uid}`) is not in the auto-delete list.", parse_mode="Markdown")
+
+
+
+async def unall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     caller = update.effective_user
     if not chat or chat.type not in ("group", "supergroup"):
         await update.message.reply_text("This command only works in groups/supergroups.")
         return
     if not is_authorized(chat.id, caller.id):
-        await update.message.reply_text("You are not authorized to use this bot (owner or allowed admin only).")
+        await update.message.reply_text("Only owner/allowed admins can do this.")
         return
-    target = await resolve_target_user(update, context)
-    if not target:
-        await update.message.reply_text("Reply to the user or provide @username / id: /un @user")
-        return
-    MUTED.get(chat.id, set()).discard(target.id)
-    await update.message.reply_text(f"✅ {target.full_name} removed from auto-delete list (in-memory).")
+    MUTED.pop(chat.id, None)
+    await update.message.reply_text("✅ Cleared all auto-muted users in this chat (in-memory).")
+
 
 
 async def listmuted(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -403,6 +455,7 @@ def main():
     app.add_handler(CommandHandler("m", muteadmin))
     app.add_handler(CommandHandler("un", unmuteadmin))
     app.add_handler(CommandHandler("listmuted", listmuted))
+    app.add_handler(CommandHandler("unall", unall_cmd))
 
     app.add_handler(MessageHandler(filters.ALL, on_any_message))
 
