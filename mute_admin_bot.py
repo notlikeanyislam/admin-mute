@@ -406,15 +406,14 @@ def main():
 
     app.add_handler(MessageHandler(filters.ALL, on_any_message))
 
-    # Derive webhook_path (optional) and port
+        # Derive webhook_path (optional) and port
     webhook_path = WEBHOOK_PATH or None
-    # if user provided WEBHOOK_URL, we assume it contains path; pass it to run_webhook
     port = int(os.environ.get("PORT", os.environ.get("RENDER_PORT", "8443")))
 
     logger.info("Starting webhook server (listening on 0.0.0.0:%s)", port)
     # run webhook: listen on all interfaces; Render will provide HTTPS externally
     # run_webhook will block until terminated
-    app.run_webhook(listen="0.0.0.0", port=port, webhook_url=WEBHOOK_URL, webhook_path=webhook_path)
+    app.run_webhook(listen="0.0.0.0", port=port, webhook_url=WEBHOOK_URL)
 
 
 if __name__ == "__main__":
