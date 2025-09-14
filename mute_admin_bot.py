@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # mute_admin_bot_no_db.py  (no DB, in-memory only)
 import logging
+import asyncio
+import time
+from collections import defaultdict, deque
 import os
 from typing import Optional, Dict, Set
 
@@ -29,6 +32,22 @@ MUTED: Dict[int, Set[int]] = {}
 ALLOWED_ADMINS: Dict[int, Set[int]] = {}
 # Global owner (int or None) - if OWNER_ID_ENV set then it takes precedence
 _owner_in_memory: Optional[int] = None
+
+
+# ====== CONFIG for deletion worker ======
+DELETE_RATE_PER_SECOND = 20        # increase for faster deletes (tune down if you hit limits)
+DEBOUNCE_WINDOW_SECONDS = 0.6      # collapse bursts within this window
+MAX_QUEUE_SIZE = 4000              # safety cap
+SPAM_NOTIFY_THRESHOLD = 20         # number of messages queued from same user to treat as heavy spam
+# =======================================
+
+_delete_queue: "asyncio.Queue[tuple[int,int,int]]" = None
+_last_seen_by_user: dict[tuple[int,int], float] = defaultdict(float)
+_pending_messages_by_user: dict[tuple[int,int], deque[int]] = defaultdict(lambda: deque(maxlen=50))
+_user_spam_counters: dict[tuple[int,int], int] = defaultdict(int)
+
+
+
 
 # ----- Helpers -----
 def get_owner() -> Optional[int]:
@@ -66,13 +85,103 @@ async def resolve_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE
             return member.user
     except Exception:
         return None
+    
+
+async def _delete_worker(app):
+    global _delete_queue
+    if _delete_queue is None:
+        _delete_queue = asyncio.Queue()
+    # base interval between deletions (seconds)
+    base_interval = 1.0 / max(1, DELETE_RATE_PER_SECOND)
+    bot = app.bot
+
+    # backoff state
+    backoff_multiplier = 1.0
+    min_backoff = base_interval
+    max_backoff = 10.0  # if many errors, wait up to 10s between deletes
+
+    while True:
+        try:
+            chat_id, msg_id, user_id = await _delete_queue.get()
+            try:
+                await bot.delete_message(chat_id, msg_id)
+                app.logger.debug("Deleted msg %s from user %s in chat %s", msg_id, user_id, chat_id)
+                # success -> slowly move back to normal rate
+                backoff_multiplier = max(1.0, backoff_multiplier * 0.95)
+            except RetryAfter as e:
+                # Telegram explicitly told us to wait 'retry_after' seconds
+                wait = float(getattr(e, "retry_after", 1.0))
+                app.logger.warning("Rate limited by Telegram: retry_after=%.2f, backing off.", wait)
+                # re-enqueue this message for later deletion (at the front)
+                try:
+                    # put it back at front by creating new queue with this item first could be heavy;
+                    # simpler: sleep then re-enqueue at end (we logged), since we respect order roughly
+                    await asyncio.sleep(wait)
+                    await _delete_queue.put((chat_id, msg_id, user_id))
+                except Exception:
+                    app.logger.exception("Failed to re-enqueue after RetryAfter")
+                # increase multiplier conservatively
+                backoff_multiplier = min(8.0, backoff_multiplier * 2.0)
+            except TelegramError as e:
+                # Non-Retry Telegram errors (Forbidden, BadRequest, etc.)
+                app.logger.debug("TelegramError during delete: %s", e)
+                # don't aggressively backoff for BadRequest (message already deleted etc.)
+                # small sleep to avoid tight loop
+                await asyncio.sleep(min_backoff)
+            except Exception as e:
+                # Unexpected errors -> exponential backoff
+                app.logger.exception("Unexpected delete error: %s", e)
+                backoff_multiplier = min(8.0, backoff_multiplier * 1.5)
+                await asyncio.sleep(min(max_backoff, base_interval * backoff_multiplier))
+            else:
+                # normal paced sleep between deletions
+                await asyncio.sleep(min(max_backoff, base_interval * backoff_multiplier))
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            app.logger.exception("Delete worker top-level error, sleeping briefly.")
+            await asyncio.sleep(1.0)
+
+
+def _enqueue_delete(app, chat_id: int, message_id: int, user_id: int):
+    """Non-blocking enqueue with safety bounding and small dedup optimization:
+       if the last queued item is from the same chat+user, we can drop older queued items for that pair.
+    """
+    global _delete_queue
+    if _delete_queue is None:
+        _delete_queue = asyncio.Queue()
+
+    # safety bounding
+    try:
+        qsize = _delete_queue.qsize()
+    except Exception:
+        qsize = 0
+
+    if qsize >= MAX_QUEUE_SIZE:
+        # drop one oldest to keep memory bounded
+        try:
+            _delete_queue.get_nowait()
+        except Exception:
+            pass
+
+    # simple try to reduce duplicates: if pending messages buffer already holds later msgs for this user,
+    # it's okay to enqueue the newest only (we already collapse pending into newest before enqueueing).
+    try:
+        _delete_queue.put_nowait((chat_id, message_id, user_id))
+    except asyncio.QueueFull:
+        # fallback: schedule put
+        try:
+            asyncio.get_event_loop().create_task(_delete_queue.put((chat_id, message_id, user_id)))
+        except Exception:
+            app.logger.exception("Failed to schedule enqueue for delete")
+
 
 # ----- Command handlers -----
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "I'm alive (no DB mode).\n"
         "Set OWNER_ID env var to lock ownership across restarts.\n"
-        "Commands: /myid, /claimowner, /allowadmin, /disallowadmin, /listallowed, /m, /um, /listmuted"
+        "Commands: /myid, /claimowner, /allowadmin, /disallowadmin, /listallowed, /m, /un, /listmuted"
     )
 
 async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,12 +315,52 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = msg.from_user
     if not sender:
         return
+
     if sender.id in MUTED.get(chat.id, set()):
+        key = (chat.id, sender.id)
+        now = time.time()
+
+        # push id into pending buffer (maintain order)
+        pending = _pending_messages_by_user[key]
+        pending.append(msg.message_id)
+        _last_seen_by_user[key] = now
+
+        # increase spam counter
+        _user_spam_counters[key] += 1
+        # notify owner if spam is heavy
+        if _user_spam_counters[key] == SPAM_NOTIFY_THRESHOLD:
+            owner = get_owner()
+            if owner:
+                try:
+                    await context.bot.send_message(owner, f"⚠️ Heavy spam detected from user `{sender.id}` in chat `{chat.id}`. Consider demoting or removing them.", parse_mode="Markdown")
+                except Exception:
+                    pass
+
+        # schedule a flush if not already scheduled: flush after debounce window
+        async def _flush_after_delay(app, k, delay):
+            await asyncio.sleep(delay)
+            # if no new messages during the window, flush the most recent one
+            last = _last_seen_by_user.get(k, 0.0)
+            if time.time() - last >= delay:
+                pend = _pending_messages_by_user.get(k)
+                if not pend:
+                    return
+                # only keep the newest message id to delete (collapse)
+                newest_mid = None
+                while pend:
+                    newest_mid = pend.popleft()
+                if newest_mid:
+                    _enqueue_delete(app, k[0], newest_mid, k[1])
+                # reset spam counter and last seen
+                _user_spam_counters[k] = 0
+                _last_seen_by_user[k] = 0.0
+
+        # schedule flush (non-blocking)
         try:
-            await context.bot.delete_message(chat.id, msg.message_id)
-            logger.info("Deleted message %s from user %s in chat %s", msg.message_id, sender.id, chat.id)
-        except Exception as e:
-            logger.warning("Failed to delete message: %s", e)
+            context.application.create_task(_flush_after_delay(context.application, key, DEBOUNCE_WINDOW_SECONDS))
+        except Exception:
+            asyncio.create_task(_flush_after_delay(context.application, key, DEBOUNCE_WINDOW_SECONDS))
+
 
 # --- Main ---
 def main():
@@ -234,6 +383,14 @@ def main():
 
     # catch all messages
     app.add_handler(MessageHandler(filters.ALL, on_any_message))
+
+        # start delete worker
+    try:
+        app.create_task(_delete_worker(app))
+    except Exception:
+        import asyncio
+        asyncio.get_event_loop().create_task(_delete_worker(app))
+
 
     logger.info("Starting bot (no DB)...")
     app.run_polling()
