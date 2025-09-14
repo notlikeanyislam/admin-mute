@@ -318,10 +318,25 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-        # schedule a flush if not already scheduled: flush after debounce window
+        # --- NEW: if the muted sender is an admin or creator, flush all pending immediately ---
+        try:
+            member = await context.bot.get_chat_member(chat.id, sender.id)
+            if member.status in ("administrator", "creator"):
+                # enqueue *all* pending messages immediately (no debounce)
+                while pending:
+                    mid = pending.popleft()
+                    _enqueue_delete(context.application, chat.id, mid, sender.id)
+                # reset counters
+                _user_spam_counters[key] = 0
+                _last_seen_by_user[key] = 0.0
+                return
+        except Exception:
+            # if get_chat_member fails, fall back to normal behavior
+            pass
+
+        # schedule a flush after debounce window (existing behavior)
         async def _flush_after_delay(app, k, delay):
             await asyncio.sleep(delay)
-            # if no new messages during the window, flush the most recent one
             last = _last_seen_by_user.get(k, 0.0)
             if time.time() - last >= delay:
                 pend = _pending_messages_by_user.get(k)
@@ -342,6 +357,7 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.application.create_task(_flush_after_delay(context.application, key, DEBOUNCE_WINDOW_SECONDS))
         except Exception:
             asyncio.create_task(_flush_after_delay(context.application, key, DEBOUNCE_WINDOW_SECONDS))
+
 
 
 # --- Main ---
