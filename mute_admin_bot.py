@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-# mute_admin_bot.py
+# mute_admin_bot_no_db.py  (no DB, in-memory only)
 import logging
-import sqlite3
 import os
-from contextlib import closing
-from typing import Optional
+from typing import Optional, Dict, Set
 
 from telegram import Update, User
 from telegram.ext import (
@@ -16,231 +14,125 @@ from telegram.ext import (
 )
 
 # ---------- CONFIG ----------
-DB_PATH = os.environ.get("DB_PATH", "muted_admins.db")
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-OWNER_ID_ENV = os.environ.get("OWNER_ID")  # optional: set to your numeric Telegram user id
+OWNER_ID_ENV = os.environ.get("OWNER_ID")  # numeric Telegram id (recommended)
 if not TOKEN:
-    raise RuntimeError("Set the TELEGRAM_BOT_TOKEN environment variable.")
+    raise RuntimeError("Set TELEGRAM_BOT_TOKEN environment variable.")
 # ----------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ----- DB Helpers -----
-def init_db():
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS muted (
-                chat_id INTEGER,
-                user_id INTEGER,
-                PRIMARY KEY(chat_id, user_id)
-            )"""
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS allowed_admins (
-                chat_id INTEGER,
-                user_id INTEGER,
-                PRIMARY KEY(chat_id, user_id)
-            )"""
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS owner (
-                owner_id INTEGER PRIMARY KEY
-            )"""
-        )
-        con.commit()
+# --- In-memory stores (lost on restart) ---
+# Structure: { chat_id: set(user_id, ...) }
+MUTED: Dict[int, Set[int]] = {}
+ALLOWED_ADMINS: Dict[int, Set[int]] = {}
+# Global owner (int or None) - if OWNER_ID_ENV set then it takes precedence
+_owner_in_memory: Optional[int] = None
 
-def add_muted(chat_id: int, user_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("INSERT OR IGNORE INTO muted(chat_id,user_id) VALUES (?,?)", (chat_id, user_id))
-        con.commit()
-
-def remove_muted(chat_id: int, user_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("DELETE FROM muted WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        con.commit()
-
-def list_muted(chat_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("SELECT user_id FROM muted WHERE chat_id=?", (chat_id,))
-        return [row[0] for row in cur.fetchall()]
-
-def is_muted(chat_id: int, user_id: int) -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("SELECT 1 FROM muted WHERE chat_id=? AND user_id=? LIMIT 1", (chat_id, user_id))
-        return cur.fetchone() is not None
-
-# allowed-admins helpers
-def add_allowed_admin(chat_id: int, user_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("INSERT OR IGNORE INTO allowed_admins(chat_id,user_id) VALUES (?,?)", (chat_id, user_id))
-        con.commit()
-
-def remove_allowed_admin(chat_id: int, user_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("DELETE FROM allowed_admins WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        con.commit()
-
-def list_allowed_admins(chat_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("SELECT user_id FROM allowed_admins WHERE chat_id=?", (chat_id,))
-        return [row[0] for row in cur.fetchall()]
-
-def is_allowed_admin(chat_id: int, user_id: int) -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("SELECT 1 FROM allowed_admins WHERE chat_id=? AND user_id=? LIMIT 1", (chat_id, user_id))
-        return cur.fetchone() is not None
-
-# owner helpers
-def get_owner_from_db() -> Optional[int]:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("SELECT owner_id FROM owner LIMIT 1")
-        row = cur.fetchone()
-        return row[0] if row else None
-
-def set_owner_in_db(user_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("INSERT OR REPLACE INTO owner(owner_id) VALUES (?)", (user_id,))
-        con.commit()
-
-def clear_owner_in_db():
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("DELETE FROM owner")
-        con.commit()
-
-# ----- Authorization -----
+# ----- Helpers -----
 def get_owner() -> Optional[int]:
-    """Return numeric owner id. Priority: OWNER_ID env var, else DB value."""
+    """Return numeric owner id. Priority: OWNER_ID env var, else in-memory claimed owner."""
     if OWNER_ID_ENV:
         try:
             return int(OWNER_ID_ENV)
         except Exception:
             return None
-    return get_owner_from_db()
+    return _owner_in_memory
 
 def is_authorized(chat_id: int, user_id: int) -> bool:
-    """Authorized if user is global owner or allowed admin for this chat."""
     owner = get_owner()
     if owner and user_id == owner:
         return True
-    return is_allowed_admin(chat_id, user_id)
+    # allowed admin for this chat?
+    return user_id in ALLOWED_ADMINS.get(chat_id, set())
 
-# ----- Utilities -----
 async def resolve_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[User]:
-    """Resolve target user from reply, @username or id arg. Returns User or None."""
+    """Resolve from reply, @username or numeric id (best-effort)."""
     if update.message.reply_to_message:
         return update.message.reply_to_message.from_user
     args = context.args
     if not args:
         return None
     arg = args[0]
-    if arg.startswith("@"):
-        try:
-            member = await context.bot.get_chat_member(update.effective_chat.id, arg)
+    chat_id = update.effective_chat.id
+    try:
+        if arg.startswith("@"):
+            member = await context.bot.get_chat_member(chat_id, arg)
             return member.user
-        except Exception:
-            return None
-    else:
-        try:
+        else:
             uid = int(arg)
-            member = await context.bot.get_chat_member(update.effective_chat.id, uid)
+            member = await context.bot.get_chat_member(chat_id, uid)
             return member.user
-        except Exception:
-            return None
+    except Exception:
+        return None
 
 # ----- Command handlers -----
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "I'm alive.\n"
-        "Owner can set allowed admins with /allowadmin (reply or @username or id).\n"
-        "Commands: /myid, /claimowner (if OWNER_ID not set), /allowadmin, /disallowadmin, /listallowed, /muteadmin, /unmuteadmin, /listmuted"
+        "I'm alive (no DB mode).\n"
+        "Set OWNER_ID env var to lock ownership across restarts.\n"
+        "Commands: /myid, /claimowner, /allowadmin, /disallowadmin, /listallowed, /muteadmin, /unmuteadmin, /listmuted"
     )
 
 async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    await update.message.reply_text(f"Your numeric Telegram id is: `{uid}`", parse_mode="Markdown")
+    await update.message.reply_text(f"Your numeric Telegram id is: `{update.effective_user.id}`", parse_mode="Markdown")
 
 async def claimowner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Claim ownership only if no OWNER_ID env var and no owner in DB."""
+    global _owner_in_memory
     if OWNER_ID_ENV:
-        await update.message.reply_text("OWNER_ID is set as an environment variable; cannot claim owner.")
+        await update.message.reply_text("OWNER_ID is set as an environment variable; you cannot claim ownership.")
         return
-    current = get_owner_from_db()
-    if current:
-        await update.message.reply_text("Owner already set — cannot claim.")
+    if _owner_in_memory:
+        await update.message.reply_text("Owner already claimed in-memory. Restart clears it.")
         return
-    caller = update.effective_user.id
-    set_owner_in_db(caller)
-    await update.message.reply_text("You are now the owner of this bot. (You can still set OWNER_ID env var if you prefer.)")
+    _owner_in_memory = update.effective_user.id
+    await update.message.reply_text("You claimed ownership (in-memory). Note: this will be lost if the bot restarts.")
 
-# owner-only admin management
+# owner-only: add allowed admin for a chat
 async def allowadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     caller = update.effective_user
     if not chat or chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("This command works only in groups/supergroups.")
+        await update.message.reply_text("This command only works in groups/supergroups.")
         return
-
-    # Only global owner can add allowed admins
     owner = get_owner()
     if not owner or caller.id != owner:
-        await update.message.reply_text("Only the bot owner can add allowed admins. (Use /claimowner if OWNER_ID not set.)")
+        await update.message.reply_text("Only the bot owner can add allowed admins.")
         return
-
-    target_user = await resolve_target_user(update, context)
-    if not target_user:
-        await update.message.reply_text("Reply to the user or provide their @username or numeric id: /allowadmin @username")
+    target = await resolve_target_user(update, context)
+    if not target:
+        await update.message.reply_text("Reply to the user or provide @username / id: /allowadmin @user")
         return
-
-    add_allowed_admin(chat.id, target_user.id)
-    await update.message.reply_text(f"✅ {target_user.full_name} is now an allowed admin in this chat.")
+    ALLOWED_ADMINS.setdefault(chat.id, set()).add(target.id)
+    await update.message.reply_text(f"✅ {target.full_name} is now an allowed admin in this chat (in-memory).")
 
 async def disallowadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     caller = update.effective_user
     if not chat or chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("This command works only in groups/supergroups.")
+        await update.message.reply_text("This command only works in groups/supergroups.")
         return
-
     owner = get_owner()
     if not owner or caller.id != owner:
         await update.message.reply_text("Only the bot owner can remove allowed admins.")
         return
-
-    target_user = await resolve_target_user(update, context)
-    if not target_user:
-        await update.message.reply_text("Reply to the user or provide their @username or numeric id: /disallowadmin @username")
+    target = await resolve_target_user(update, context)
+    if not target:
+        await update.message.reply_text("Reply to the user or provide @username / id: /disallowadmin @user")
         return
-
-    remove_allowed_admin(chat.id, target_user.id)
-    await update.message.reply_text(f"✅ {target_user.full_name} removed from allowed admins in this chat.")
+    ALLOWED_ADMINS.get(chat.id, set()).discard(target.id)
+    await update.message.reply_text(f"✅ {target.full_name} removed from allowed admins (in-memory).")
 
 async def listallowed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat or chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("This command works only in groups/supergroups.")
+        await update.message.reply_text("This command only works in groups/supergroups.")
         return
-
-    users = list_allowed_admins(chat.id)
+    users = ALLOWED_ADMINS.get(chat.id, set())
     if not users:
-        await update.message.reply_text("No allowed admins in this chat.")
+        await update.message.reply_text("No allowed admins (in-memory).")
         return
-
     lines = []
     for uid in users:
         try:
@@ -248,63 +140,54 @@ async def listallowed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"- {member.user.full_name} (`{uid}`)")
         except Exception:
             lines.append(f"- `{uid}`")
-    await update.message.reply_text("Allowed admins:\n" + "\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("Allowed admins (in-memory):\n" + "\n".join(lines), parse_mode="Markdown")
 
-# --- Existing mute admin commands but now check is_authorized ---
+# mute/unmute/list (owner or allowed admin only)
 async def muteadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     caller = update.effective_user
     if not chat or chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("This command works only in groups/supergroups.")
+        await update.message.reply_text("This command only works in groups/supergroups.")
         return
-
     if not is_authorized(chat.id, caller.id):
-        await update.message.reply_text("You are not authorized to use this bot. Only the owner and allowed admins can use it.")
+        await update.message.reply_text("You are not authorized to use this bot (owner or allowed admin only).")
         return
-
-    target_user = await resolve_target_user(update, context)
-    if not target_user:
-        await update.message.reply_text("Reply to the user or provide their @username or numeric id: /muteadmin @username")
+    target = await resolve_target_user(update, context)
+    if not target:
+        await update.message.reply_text("Reply to the user or provide @username / id: /muteadmin @user")
         return
-
-    add_muted(chat.id, target_user.id)
-    await update.message.reply_text(f"✅ Added {target_user.full_name} to auto-delete list in this chat.")
+    MUTED.setdefault(chat.id, set()).add(target.id)
+    await update.message.reply_text(f"✅ {target.full_name} added to auto-delete list (in-memory).")
 
 async def unmuteadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     caller = update.effective_user
     if not chat or chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("This command works only in groups/supergroups.")
+        await update.message.reply_text("This command only works in groups/supergroups.")
         return
-
     if not is_authorized(chat.id, caller.id):
-        await update.message.reply_text("You are not authorized to use this bot. Only the owner and allowed admins can use it.")
+        await update.message.reply_text("You are not authorized to use this bot (owner or allowed admin only).")
         return
-
-    target_user = await resolve_target_user(update, context)
-    if not target_user:
-        await update.message.reply_text("Reply to the user or provide their @username or numeric id: /unmuteadmin @username")
+    target = await resolve_target_user(update, context)
+    if not target:
+        await update.message.reply_text("Reply to the user or provide @username / id: /unmuteadmin @user")
         return
-
-    remove_muted(chat.id, target_user.id)
-    await update.message.reply_text(f"✅ Removed {target_user.full_name} from auto-delete list in this chat.")
+    MUTED.get(chat.id, set()).discard(target.id)
+    await update.message.reply_text(f"✅ {target.full_name} removed from auto-delete list (in-memory).")
 
 async def listmuted(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     caller = update.effective_user
     if not chat or chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("This command works only in groups/supergroups.")
+        await update.message.reply_text("This command only works in groups/supergroups.")
         return
-
     if not is_authorized(chat.id, caller.id):
-        await update.message.reply_text("You are not authorized to use this bot. Only the owner and allowed admins can use it.")
+        await update.message.reply_text("You are not authorized to use this bot (owner or allowed admin only).")
         return
-
-    users = list_muted(chat.id)
+    users = MUTED.get(chat.id, set())
     if not users:
-        await update.message.reply_text("No users are auto-muted in this chat.")
+        await update.message.reply_text("No users are auto-muted in this chat (in-memory).")
         return
-
     lines = []
     for uid in users:
         try:
@@ -312,9 +195,9 @@ async def listmuted(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"- {member.user.full_name} (`{uid}`)")
         except Exception:
             lines.append(f"- `{uid}`")
-    await update.message.reply_text("Auto-delete list:\n" + "\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("Auto-delete list (in-memory):\n" + "\n".join(lines), parse_mode="Markdown")
 
-# Message handler: auto-delete if muted (runs for any message)
+# auto-delete handler
 async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
@@ -323,7 +206,7 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = msg.from_user
     if not sender:
         return
-    if is_muted(chat.id, sender.id):
+    if sender.id in MUTED.get(chat.id, set()):
         try:
             await context.bot.delete_message(chat.id, msg.message_id)
             logger.info("Deleted message %s from user %s in chat %s", msg.message_id, sender.id, chat.id)
@@ -332,7 +215,6 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main ---
 def main():
-    init_db()
     app = ApplicationBuilder().token(TOKEN).build()
 
     # info / owner helpers
@@ -350,10 +232,10 @@ def main():
     app.add_handler(CommandHandler("unmuteadmin", unmuteadmin))
     app.add_handler(CommandHandler("listmuted", listmuted))
 
-    # catch ALL messages and attempt deletion if needed
+    # catch all messages
     app.add_handler(MessageHandler(filters.ALL, on_any_message))
 
-    logger.info("Starting bot...")
+    logger.info("Starting bot (no DB)...")
     app.run_polling()
 
 if __name__ == "__main__":
