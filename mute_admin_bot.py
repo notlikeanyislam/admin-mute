@@ -277,28 +277,27 @@ async def unmuteadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You are not authorized to use this bot (owner or allowed admin only).")
         return
 
-    # Ensure we operate on the real set stored in MUTED
+    # Always operate on the real set
     chat_set = MUTED.setdefault(chat.id, set())
 
-    # 1) If reply -> target = replied user
     target_user = None
+    # 1) reply -> exact target
     if update.message.reply_to_message:
         target_user = update.message.reply_to_message.from_user
 
-    # 2) If args provided -> try username or numeric id
+    # 2) else try args
     if not target_user and context.args:
         arg = context.args[0].strip()
-        # if numeric id
+        # numeric id path
         try:
             uid = int(arg)
-            # remove by id even if user not in chat — use setdefault to modify actual store
             chat_set.discard(uid)
+            logger.info("unmute by id: caller=%s chat=%s uid=%s", caller.id, chat.id, uid)
             await update.message.reply_text(f"✅ User id `{uid}` removed from auto-delete list (if present).", parse_mode="Markdown")
             return
         except ValueError:
-            # not numeric, maybe @username
+            # maybe @username
             if arg.startswith("@"):
-                # try to resolve via get_chat_member (best-effort)
                 try:
                     member = await context.bot.get_chat_member(chat.id, arg)
                     target_user = member.user
@@ -310,13 +309,14 @@ async def unmuteadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Reply to the user or provide @username / id: /un @user or /un 123456789")
         return
 
-    # now we have a User object
     uid = target_user.id
+    logger.info("unmute by user object: caller=%s chat=%s target=%s", caller.id, chat.id, uid)
     if uid in chat_set:
         chat_set.discard(uid)
         await update.message.reply_text(f"✅ {target_user.full_name} (`{uid}`) removed from auto-delete list (in-memory).", parse_mode="Markdown")
     else:
         await update.message.reply_text(f"User {target_user.full_name} (`{uid}`) is not in the auto-delete list.", parse_mode="Markdown")
+
 
 
 
@@ -343,17 +343,24 @@ async def listmuted(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(chat.id, caller.id):
         await update.message.reply_text("You are not authorized to use this bot (owner or allowed admin only).")
         return
+
     users = MUTED.get(chat.id, set())
     if not users:
         await update.message.reply_text("No users are auto-muted in this chat.")
         return
+
     lines = []
-    for uid in users:
+    for uid in sorted(users):
         try:
             member = await context.bot.get_chat_member(chat.id, uid)
-            lines.append(f"- {member.user.full_name} (`{uid}`)")
+            uname = getattr(member.user, "username", None)
+            add = f" - @{uname}" if uname else ""
+            lines.append(f"- {member.user.full_name} (`{uid}`){add}")
         except Exception:
-            lines.append(f"- `{uid}`")
+            # show numeric id when we can't resolve or user left
+            lines.append(f"- `{uid}` (could not resolve name)")
+    # log raw state for debugging
+    logger.info("listmuted called by %s in chat %s -> muted_ids=%s", caller.id, chat.id, list(users))
     await update.message.reply_text("Auto-delete list:\n" + "\n".join(lines), parse_mode="Markdown")
 
 
