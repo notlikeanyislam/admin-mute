@@ -406,8 +406,9 @@ def main():
 
     app.add_handler(MessageHandler(filters.ALL, on_any_message))
 
-        # Derive webhook_path (optional) and port
+    # Derive webhook_path (optional) and port
     webhook_path = WEBHOOK_PATH or None
+
     port = int(os.environ.get("PORT", os.environ.get("RENDER_PORT", "8443")))
 
     logger.info("Starting webhook server (listening on 0.0.0.0:%s)", port)
