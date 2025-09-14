@@ -72,7 +72,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "I'm alive (no DB mode).\n"
         "Set OWNER_ID env var to lock ownership across restarts.\n"
-        "Commands: /myid, /claimowner, /allowadmin, /disallowadmin, /listallowed, /muteadmin, /unmuteadmin, /listmuted"
+        "Commands: /myid, /claimowner, /allowadmin, /disallowadmin, /listallowed, /m, /um, /listmuted"
     )
 
 async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,7 +154,7 @@ async def muteadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target = await resolve_target_user(update, context)
     if not target:
-        await update.message.reply_text("Reply to the user or provide @username / id: /muteadmin @user")
+        await update.message.reply_text("Reply to the user or provide @username / id: /m @user")
         return
     MUTED.setdefault(chat.id, set()).add(target.id)
     await update.message.reply_text(f"✅ {target.full_name} added to auto-delete list (in-memory).")
@@ -170,7 +170,7 @@ async def unmuteadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target = await resolve_target_user(update, context)
     if not target:
-        await update.message.reply_text("Reply to the user or provide @username / id: /unmuteadmin @user")
+        await update.message.reply_text("Reply to the user or provide @username / id: /un @user")
         return
     MUTED.get(chat.id, set()).discard(target.id)
     await update.message.reply_text(f"✅ {target.full_name} removed from auto-delete list (in-memory).")
@@ -228,8 +228,8 @@ def main():
     app.add_handler(CommandHandler("listallowed", listallowed_cmd))
 
     # mute/unmute/list - only owner or allowed admins may call
-    app.add_handler(CommandHandler("muteadmin", muteadmin))
-    app.add_handler(CommandHandler("unmuteadmin", unmuteadmin))
+    app.add_handler(CommandHandler("m", muteadmin))
+    app.add_handler(CommandHandler("un", unmuteadmin))
     app.add_handler(CommandHandler("listmuted", listmuted))
 
     # catch all messages
