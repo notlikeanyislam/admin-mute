@@ -13,6 +13,7 @@ Optional:
 """
 import asyncio
 import logging
+import json
 import os
 import time
 from collections import defaultdict, deque
@@ -48,6 +49,16 @@ SPAM_NOTIFY_THRESHOLD = int(os.environ.get("SPAM_NOTIFY_THRESHOLD", "20"))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def format_user(user):
+    """Return consistent human-friendly string for a telegram.User"""
+    if not user:
+        return "<unknown>"
+    uname = f"@{user.username}" if getattr(user, "username", None) else ""
+    # use Markdown formatting for code-style id
+    return f"{user.full_name} {uname} (`{user.id}`)"
+
+
 # --- In-memory stores (lost on restart) ---
 MUTED: Dict[int, Set[int]] = {}
 ALLOWED_ADMINS: Dict[int, Set[int]] = {}
@@ -78,27 +89,53 @@ def is_authorized(chat_id: int, user_id: int) -> bool:
 
 
 async def resolve_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[User]:
+    """Resolve a target user from a reply, numeric id, or username (@username or username)."""
     if update.message is None:
         return None
+
+    # 1) If command is used as a reply, use the replied-to user (most reliable)
     if update.message.reply_to_message:
         return update.message.reply_to_message.from_user
+
+    # 2) Otherwise try to resolve from args
     args = context.args
     if not args:
         return None
-    arg = args[0]
+
+    arg = args[0].strip()
     chat = update.effective_chat
     if not chat:
         return None
+
+    # 3) Try numeric id first
     try:
-        if arg.startswith("@"):
-            member = await context.bot.get_chat_member(chat.id, arg)
-            return member.user
-        else:
-            uid = int(arg)
+        uid = int(arg)
+    except ValueError:
+        uid = None
+
+    if uid is not None:
+        try:
             member = await context.bot.get_chat_member(chat.id, uid)
             return member.user
+        except Exception:
+            # numeric id provided but not resolvable — fallthrough to username attempts (if any)
+            pass
+
+    # 4) Try username forms (strip leading '@' if present)
+    lookup = arg.lstrip("@")
+    try:
+        # most PTB/backends accept plain username
+        member = await context.bot.get_chat_member(chat.id, lookup)
+        return member.user
     except Exception:
-        return None
+        # some setups accept @username; try that as a last attempt
+        try:
+            member = await context.bot.get_chat_member(chat.id, f"@{lookup}")
+            return member.user
+        except Exception:
+            return None
+
+
 
 
 # ----- Delete worker / queueing -----
@@ -192,6 +229,14 @@ async def claimowner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _owner_in_memory = update.effective_user.id
     await update.message.reply_text("You claimed ownership (in-memory). Note: this will be lost if the bot restarts.")
 
+async def dumpallowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    owner = get_owner()
+    caller = update.effective_user
+    if owner and caller.id != owner:
+        await update.message.reply_text("Owner only.")
+        return
+    await update.message.reply_text("ALLOWED_ADMINS raw:\n" + json.dumps({str(k): list(v) for k, v in ALLOWED_ADMINS.items()}))
+
 
 async def allowadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -203,12 +248,63 @@ async def allowadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not owner or caller.id != owner:
         await update.message.reply_text("Only the bot owner can add allowed admins.")
         return
-    target = await resolve_target_user(update, context)
+
+    # resolve target (reply preferred)
+    target = None
+    if update.message.reply_to_message:
+        target = update.message.reply_to_message.from_user
+    else:
+        target = await resolve_target_user(update, context)
+
     if not target:
         await update.message.reply_text("Reply to the user or provide @username / id: /allowadmin @user")
         return
+
     ALLOWED_ADMINS.setdefault(chat.id, set()).add(target.id)
-    await update.message.reply_text(f"✅ {target.full_name} is now an allowed admin in this chat (in-memory).")
+    logger.info("allowadmin: caller=%s chat=%s added_user=%s id=%s", caller.id, chat.id, target.full_name, target.id)
+    await update.message.reply_text(
+        f"✅ Added allowed admin: {format_user(target)} (in-memory).",
+        parse_mode="Markdown"
+    )
+
+    
+async def whois_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user 
+    if not context.args:
+        await update.message.reply_text("Usage: /whois <numeric_id>")
+        return
+    try:
+        uid = int(context.args[0].strip())
+    except ValueError:
+        await update.message.reply_text("Pass a numeric id, e.g. /whois 123456789")
+        return
+    chat = update.effective_chat
+    try:
+        member = await context.bot.get_chat_member(chat.id, uid)
+        uname = f"@{member.user.username}" if getattr(member.user, "username", None) else ""
+        await update.message.reply_text(f"User: {member.user.full_name} {uname} (`{uid}`)", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"Could not resolve user `{uid}` in this chat: {e}", parse_mode="Markdown")
+
+
+    # resolve target (reply preferred)
+    target = None
+    if update.message.reply_to_message:
+        target = update.message.reply_to_message.from_user
+    else:
+        target = await resolve_target_user(update, context)
+
+    if not target:
+        await update.message.reply_text("Reply to the user or provide @username / id: /allowadmin @user")
+        return
+
+    ALLOWED_ADMINS.setdefault(chat.id, set()).add(target.id)
+    uname = f"@{target.username}" if getattr(target, "username", None) else ""
+    logger.info("allowadmin: caller=%s chat=%s added_user=%s id=%s", caller.id, chat.id, target.full_name, target.id)
+    await update.message.reply_text(
+        f"✅ Added allowed admin: {target.full_name} {uname} (`{target.id}`) (in-memory).",
+        parse_mode="Markdown"
+    )
 
 
 async def disallowadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,18 +330,23 @@ async def listallowed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or chat.type not in ("group", "supergroup"):
         await update.message.reply_text("This command only works in groups/supergroups.")
         return
+
     users = ALLOWED_ADMINS.get(chat.id, set())
     if not users:
         await update.message.reply_text("No allowed admins (in-memory).")
         return
+
     lines = []
-    for uid in users:
+    for uid in sorted(users):
         try:
             member = await context.bot.get_chat_member(chat.id, uid)
-            lines.append(f"- {member.user.full_name} (`{uid}`)")
+            lines.append(f"- {format_user(member.user)}")
         except Exception:
-            lines.append(f"- `{uid}`")
+            # show numeric id when we can't resolve (user left, etc)
+            lines.append(f"- `{uid}` (could not resolve name)")
+    logger.info("listallowed called by %s in chat %s -> %s", update.effective_user.id, chat.id, list(users))
     await update.message.reply_text("Allowed admins (in-memory):\n" + "\n".join(lines), parse_mode="Markdown")
+
 
 
 async def muteadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -353,15 +454,21 @@ async def listmuted(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for uid in sorted(users):
         try:
             member = await context.bot.get_chat_member(chat.id, uid)
-            uname = getattr(member.user, "username", None)
-            add = f" - @{uname}" if uname else ""
-            lines.append(f"- {member.user.full_name} (`{uid}`){add}")
+            lines.append(f"- {format_user(member.user)}")
         except Exception:
-            # show numeric id when we can't resolve or user left
             lines.append(f"- `{uid}` (could not resolve name)")
-    # log raw state for debugging
     logger.info("listmuted called by %s in chat %s -> muted_ids=%s", caller.id, chat.id, list(users))
     await update.message.reply_text("Auto-delete list:\n" + "\n".join(lines), parse_mode="Markdown")
+
+async def dumpmuted(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    owner = get_owner()
+    caller = update.effective_user
+    if owner and caller.id != owner:
+        await update.message.reply_text("Owner only.")
+        return
+    await update.message.reply_text("MUTED raw:\n" + json.dumps({str(k): list(v) for k, v in MUTED.items()}))
+
+
 
 
 # auto-delete handler (with admin-flush)
@@ -454,10 +561,13 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("claimowner", claimowner_cmd))
+    app.add_handler(CommandHandler("dumpmuted", dumpmuted))
+
 
     app.add_handler(CommandHandler("allowadmin", allowadmin_cmd))
     app.add_handler(CommandHandler("disallowadmin", disallowadmin_cmd))
     app.add_handler(CommandHandler("listallowed", listallowed_cmd))
+    app.add_handler(CommandHandler("dumpallowed", dumpallowed))
 
     app.add_handler(CommandHandler("m", muteadmin))
     app.add_handler(CommandHandler("un", unmuteadmin))
@@ -465,6 +575,8 @@ def main():
     app.add_handler(CommandHandler("unall", unall_cmd))
 
     app.add_handler(MessageHandler(filters.ALL, on_any_message))
+    app.add_handler(CommandHandler("whois", whois_cmd))
+
 
     # Derive webhook_path (optional) and port
     webhook_path = WEBHOOK_PATH or None
